@@ -1,0 +1,14 @@
+{
+  "name": "archive-search",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker for semantic search across conversation archives via MCP",
+  "main": "src/index.js",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "migrate": "node scripts/migrate.js"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
