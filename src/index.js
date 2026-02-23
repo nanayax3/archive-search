@@ -63,8 +63,15 @@ const TOOLS = [
 // ═══ EMBEDDING ═══
 
 async function getEmbedding(ai, text) {
-  const result = await ai.run("@cf/baai/bge-base-en-v1.5", { text: [text] });
-  return result.data[0];
+  // Sanitize input — strip characters that can produce bad embeddings
+  const clean = text.replace(/[^\x20-\x7E\n\r\t]/g, ' ').slice(0, 8000);
+  const result = await ai.run("@cf/baai/bge-base-en-v1.5", { text: [clean] });
+  const embedding = result.data[0];
+  // Sanitize output — replace NaN/Infinity with 0
+  for (let i = 0; i < embedding.length; i++) {
+    if (!Number.isFinite(embedding[i])) embedding[i] = 0;
+  }
+  return embedding;
 }
 
 // ═══ TOOL HANDLERS ═══
@@ -229,7 +236,7 @@ async function handleRepairArchive(env, params) {
             metadata: {
               source_file: chunk.source_file,
               chunk_index: chunk.chunk_index,
-              preview: chunk.content.slice(0, 200),
+              preview: chunk.content.replace(/[^\x20-\x7E\n\r\t]/g, ' ').slice(0, 200),
             },
           });
           lastId = chunk.id;
@@ -346,7 +353,7 @@ async function handleIngest(request, env) {
           metadata: {
             source_file: chunk.source_file,
             chunk_index: chunk.chunk_index,
-            preview: chunk.content.slice(0, 200),
+            preview: chunk.content.replace(/[^\x20-\x7E\n\r\t]/g, ' ').slice(0, 200),
           },
         });
       } catch (error) {
@@ -488,6 +495,75 @@ export default {
     // Ingest endpoint
     if (url.pathname === "/ingest" && request.method === "POST") {
       return handleIngest(request, env);
+    }
+
+    // Find and fix missing vectors (paginated)
+    if (url.pathname === "/find-missing" && request.method === "POST") {
+      const body = await request.json().catch(() => ({}));
+      const offset = body.offset || 0;
+      const pageSize = 200; // check 200 chunks per call
+
+      try {
+        // Get a page of chunk IDs from D1
+        const pageChunks = await env.DB.prepare(
+          "SELECT id, content, source_file, chunk_index FROM archive_chunks ORDER BY id LIMIT ? OFFSET ?"
+        ).bind(pageSize, offset).all();
+
+        if (!pageChunks.results || pageChunks.results.length === 0) {
+          return new Response(JSON.stringify({
+            status: "complete",
+            message: "Scanned all chunks. No more pages.",
+            offset,
+          }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+        }
+
+        // Check which ones have vectors (batches of 20)
+        const missing = [];
+        for (let i = 0; i < pageChunks.results.length; i += 20) {
+          const batch = pageChunks.results.slice(i, i + 20);
+          const batchIds = batch.map(c => `chunk-${c.id}`);
+          const found = await env.VECTORS.getByIds(batchIds);
+          const foundSet = new Set(found.map(v => v.id));
+          for (let j = 0; j < batch.length; j++) {
+            if (!foundSet.has(`chunk-${batch[j].id}`)) {
+              missing.push(batch[j]);
+            }
+          }
+        }
+
+        // Re-embed the missing ones
+        let repaired = 0;
+        const errors = [];
+        for (const chunk of missing) {
+          try {
+            const embedding = await getEmbedding(env.AI, chunk.content.slice(0, 8000));
+            await env.VECTORS.upsert([{
+              id: `chunk-${chunk.id}`,
+              values: embedding,
+              metadata: {
+                source_file: chunk.source_file,
+                chunk_index: chunk.chunk_index,
+                preview: chunk.content.replace(/[^\x20-\x7E\n\r\t]/g, ' ').slice(0, 200),
+              },
+            }]);
+            repaired++;
+          } catch (error) {
+            errors.push(`chunk-${chunk.id}: ${error.message}`);
+          }
+        }
+
+        return new Response(JSON.stringify({
+          scanned: pageChunks.results.length,
+          missing_found: missing.length,
+          repaired,
+          next_offset: offset + pageSize,
+          errors: errors.length > 0 ? errors : undefined,
+        }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
     }
 
     // Stats (HTTP, not MCP)
