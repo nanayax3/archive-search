@@ -177,7 +177,7 @@ async function handleGetStats(env) {
 // ═══ REPAIR HANDLER ═══
 
 async function handleRepairArchive(env, params) {
-  const batchSize = Math.min(Math.max(params.batch_size || 50, 1), 200);
+  const batchSize = Math.min(Math.max(params.batch_size || 200, 1), 200);
 
   try {
     // Get total count
@@ -188,94 +188,82 @@ async function handleRepairArchive(env, params) {
 
     if (total === 0) return "No chunks in database. Nothing to repair.";
 
-    // Track progress with a simple offset approach
-    // Get the last repaired ID from a meta table, or start from 0
-    let startId = 0;
-    try {
+    // Track scan progress
+    await env.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS repair_progress (id INTEGER PRIMARY KEY, last_offset INTEGER DEFAULT 0)"
+    ).run();
+    const progress = await env.DB.prepare(
+      "SELECT last_offset FROM repair_progress WHERE id = 1"
+    ).first();
+    const offset = progress ? progress.last_offset : 0;
+
+    // Get a page of chunks
+    const pageChunks = await env.DB.prepare(
+      "SELECT id, content, source_file, chunk_index FROM archive_chunks ORDER BY id LIMIT ? OFFSET ?"
+    ).bind(batchSize, offset).all();
+
+    if (!pageChunks.results || pageChunks.results.length === 0) {
+      // Full scan complete — reset for next run
       await env.DB.prepare(
-        "CREATE TABLE IF NOT EXISTS repair_progress (id INTEGER PRIMARY KEY, last_id INTEGER DEFAULT 0)"
+        "INSERT OR REPLACE INTO repair_progress (id, last_offset) VALUES (1, 0)"
       ).run();
-      const progress = await env.DB.prepare(
-        "SELECT last_id FROM repair_progress WHERE id = 1"
-      ).first();
-      if (progress) startId = progress.last_id;
-    } catch {
-      // Table might not exist yet, that's fine
+      return `Scan complete! All ${total} chunks checked.\nProgress reset for next run.`;
     }
 
-    // Get next batch of chunks to vectorize
-    const chunks = await env.DB.prepare(
-      "SELECT id, content, source_file, chunk_index FROM archive_chunks WHERE id > ? ORDER BY id LIMIT ?"
-    )
-      .bind(startId, batchSize)
-      .all();
-
-    if (!chunks.results || chunks.results.length === 0) {
-      // Reset progress for next full pass
-      await env.DB.prepare(
-        "INSERT OR REPLACE INTO repair_progress (id, last_id) VALUES (1, 0)"
-      ).run();
-      return `All chunks processed. Reset to beginning for next run.\nTotal chunks: ${total}`;
-    }
-
-    let repaired = 0;
-    let lastId = startId;
-    const errors = [];
-
-    // Process in small batches for embedding
-    for (let i = 0; i < chunks.results.length; i += 10) {
-      const batch = chunks.results.slice(i, i + 10);
-      const vectors = [];
-
+    // Check which chunks are missing vectors (batches of 20, Vectorize limit)
+    const missing = [];
+    for (let i = 0; i < pageChunks.results.length; i += 20) {
+      const batch = pageChunks.results.slice(i, i + 20);
+      const batchIds = batch.map(c => `chunk-${c.id}`);
+      const found = await env.VECTORS.getByIds(batchIds);
+      const foundSet = new Set(found.map(v => v.id));
       for (const chunk of batch) {
-        try {
-          const embedding = await getEmbedding(env.AI, chunk.content.slice(0, 8000));
-          vectors.push({
-            id: `chunk-${chunk.id}`,
-            values: embedding,
-            metadata: {
-              source_file: chunk.source_file,
-              chunk_index: chunk.chunk_index,
-              preview: chunk.content.replace(/[^\x20-\x7E\n\r\t]/g, ' ').slice(0, 200),
-            },
-          });
-          lastId = chunk.id;
-        } catch (error) {
-          errors.push(`${chunk.source_file}[${chunk.chunk_index}]: ${error.message}`);
-          lastId = chunk.id;
+        if (!foundSet.has(`chunk-${chunk.id}`)) {
+          missing.push(chunk);
         }
       }
+    }
 
-      if (vectors.length > 0) {
-        try {
-          await env.VECTORS.upsert(vectors);
-          repaired += vectors.length;
-        } catch (error) {
-          errors.push(`Upsert error: ${error.message}`);
-        }
+    // Re-embed only the missing ones
+    let repaired = 0;
+    const errors = [];
+    for (const chunk of missing) {
+      try {
+        const embedding = await getEmbedding(env.AI, chunk.content);
+        await env.VECTORS.upsert([{
+          id: `chunk-${chunk.id}`,
+          values: embedding,
+          metadata: {
+            source_file: chunk.source_file,
+            chunk_index: chunk.chunk_index,
+            preview: chunk.content.replace(/[^\x20-\x7E\n\r\t]/g, ' ').slice(0, 200),
+          },
+        }]);
+        repaired++;
+      } catch (error) {
+        errors.push(`chunk-${chunk.id}: ${error.message}`);
       }
     }
 
     // Save progress
+    const nextOffset = offset + pageChunks.results.length;
     await env.DB.prepare(
-      "INSERT OR REPLACE INTO repair_progress (id, last_id) VALUES (1, ?)"
-    )
-      .bind(lastId)
-      .run();
+      "INSERT OR REPLACE INTO repair_progress (id, last_offset) VALUES (1, ?)"
+    ).bind(nextOffset).run();
 
-    const remaining = total - lastId;
-    let output = `Repair progress:\n`;
-    output += `Total chunks: ${total}\n`;
-    output += `Processed this run: ${chunks.results.length}\n`;
-    output += `Vectors upserted: ${repaired}\n`;
-    output += `Progress: ${lastId}/${total} (${Math.round((lastId / total) * 100)}%)\n`;
-    if (remaining > 0) {
-      output += `Remaining: ~${remaining} (run again to continue)\n`;
+    let output = `Repair scan:\n`;
+    output += `Checked: ${pageChunks.results.length} chunks (offset ${offset}-${nextOffset})\n`;
+    output += `Missing vectors found: ${missing.length}\n`;
+    output += `Repaired: ${repaired}\n`;
+    output += `Progress: ${nextOffset}/${total} (${Math.round((nextOffset / total) * 100)}%)\n`;
+    if (nextOffset < total) {
+      output += `Run again to continue scanning.\n`;
     } else {
-      output += `Complete! All chunks vectorized.\n`;
+      output += `Scan complete! All chunks checked.\n`;
     }
     if (errors.length > 0) {
-      output += `Errors this run: ${errors.length}\n`;
+      output += `Errors: ${errors.length}\n`;
+      errors.forEach(e => output += `  - ${e}\n`);
     }
 
     return output;
@@ -495,75 +483,6 @@ export default {
     // Ingest endpoint
     if (url.pathname === "/ingest" && request.method === "POST") {
       return handleIngest(request, env);
-    }
-
-    // Find and fix missing vectors (paginated)
-    if (url.pathname === "/find-missing" && request.method === "POST") {
-      const body = await request.json().catch(() => ({}));
-      const offset = body.offset || 0;
-      const pageSize = 200; // check 200 chunks per call
-
-      try {
-        // Get a page of chunk IDs from D1
-        const pageChunks = await env.DB.prepare(
-          "SELECT id, content, source_file, chunk_index FROM archive_chunks ORDER BY id LIMIT ? OFFSET ?"
-        ).bind(pageSize, offset).all();
-
-        if (!pageChunks.results || pageChunks.results.length === 0) {
-          return new Response(JSON.stringify({
-            status: "complete",
-            message: "Scanned all chunks. No more pages.",
-            offset,
-          }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
-        }
-
-        // Check which ones have vectors (batches of 20)
-        const missing = [];
-        for (let i = 0; i < pageChunks.results.length; i += 20) {
-          const batch = pageChunks.results.slice(i, i + 20);
-          const batchIds = batch.map(c => `chunk-${c.id}`);
-          const found = await env.VECTORS.getByIds(batchIds);
-          const foundSet = new Set(found.map(v => v.id));
-          for (let j = 0; j < batch.length; j++) {
-            if (!foundSet.has(`chunk-${batch[j].id}`)) {
-              missing.push(batch[j]);
-            }
-          }
-        }
-
-        // Re-embed the missing ones
-        let repaired = 0;
-        const errors = [];
-        for (const chunk of missing) {
-          try {
-            const embedding = await getEmbedding(env.AI, chunk.content.slice(0, 8000));
-            await env.VECTORS.upsert([{
-              id: `chunk-${chunk.id}`,
-              values: embedding,
-              metadata: {
-                source_file: chunk.source_file,
-                chunk_index: chunk.chunk_index,
-                preview: chunk.content.replace(/[^\x20-\x7E\n\r\t]/g, ' ').slice(0, 200),
-              },
-            }]);
-            repaired++;
-          } catch (error) {
-            errors.push(`chunk-${chunk.id}: ${error.message}`);
-          }
-        }
-
-        return new Response(JSON.stringify({
-          scanned: pageChunks.results.length,
-          missing_found: missing.length,
-          repaired,
-          next_offset: offset + pageSize,
-          errors: errors.length > 0 ? errors : undefined,
-        }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
-      } catch (error) {
-        return new Response(JSON.stringify({ error: error.message }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
     }
 
     // Stats (HTTP, not MCP)

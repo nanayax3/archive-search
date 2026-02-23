@@ -100,13 +100,13 @@ Returns total chunks indexed and source file count.
 
 ### `repair_archive`
 
-Finds chunks in the database that are missing vector embeddings and re-embeds them. Run this after migration to patch gaps caused by rate limits during ingestion.
+Scans the database page by page, checks which chunks are missing vector embeddings, and re-embeds only those. Run this after migration to patch gaps caused by rate limits during ingestion.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `batch_size` | integer | no | Chunks to process per run (default 50, max 200) |
+| `batch_size` | integer | no | Chunks to scan per run (default 200, max 200) |
 
-Run multiple times if needed — it processes in batches and reports remaining count.
+The tool tracks its scan position — run it multiple times and it picks up where it left off. Once it reaches the end, it reports completion and resets. Only chunks with missing vectors get re-embedded, so repeated runs are fast when everything is healthy.
 
 ## Connecting to your AI client
 
