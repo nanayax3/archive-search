@@ -173,40 +173,51 @@ async function handleRepairArchive(env, params) {
   const batchSize = Math.min(Math.max(params.batch_size || 50, 1), 200);
 
   try {
-    // Get all chunk IDs from D1
-    const allChunks = await env.DB.prepare(
-      "SELECT id, content, source_file, chunk_index FROM archive_chunks ORDER BY id"
-    ).all();
+    // Get total count
+    const countResult = await env.DB.prepare(
+      "SELECT COUNT(*) as total FROM archive_chunks"
+    ).first();
+    const total = countResult.total;
 
-    if (!allChunks.results || allChunks.results.length === 0) {
-      return "No chunks in database. Nothing to repair.";
+    if (total === 0) return "No chunks in database. Nothing to repair.";
+
+    // Track progress with a simple offset approach
+    // Get the last repaired ID from a meta table, or start from 0
+    let startId = 0;
+    try {
+      await env.DB.prepare(
+        "CREATE TABLE IF NOT EXISTS repair_progress (id INTEGER PRIMARY KEY, last_id INTEGER DEFAULT 0)"
+      ).run();
+      const progress = await env.DB.prepare(
+        "SELECT last_id FROM repair_progress WHERE id = 1"
+      ).first();
+      if (progress) startId = progress.last_id;
+    } catch {
+      // Table might not exist yet, that's fine
     }
 
-    // Check which ones have vectors by trying to fetch them
-    const missing = [];
-    for (const chunk of allChunks.results) {
-      const vectorId = `chunk-${chunk.id}`;
-      try {
-        const result = await env.VECTORS.getByIds([vectorId]);
-        if (!result || result.length === 0) {
-          missing.push(chunk);
-        }
-      } catch {
-        missing.push(chunk);
-      }
+    // Get next batch of chunks to vectorize
+    const chunks = await env.DB.prepare(
+      "SELECT id, content, source_file, chunk_index FROM archive_chunks WHERE id > ? ORDER BY id LIMIT ?"
+    )
+      .bind(startId, batchSize)
+      .all();
+
+    if (!chunks.results || chunks.results.length === 0) {
+      // Reset progress for next full pass
+      await env.DB.prepare(
+        "INSERT OR REPLACE INTO repair_progress (id, last_id) VALUES (1, 0)"
+      ).run();
+      return `All chunks processed. Reset to beginning for next run.\nTotal chunks: ${total}`;
     }
 
-    if (missing.length === 0) {
-      return `All ${allChunks.results.length} chunks have vectors. Nothing to repair.`;
-    }
-
-    // Process missing chunks in batches
-    const toProcess = missing.slice(0, batchSize);
     let repaired = 0;
+    let lastId = startId;
     const errors = [];
 
-    for (let i = 0; i < toProcess.length; i += 10) {
-      const batch = toProcess.slice(i, i + 10);
+    // Process in small batches for embedding
+    for (let i = 0; i < chunks.results.length; i += 10) {
+      const batch = chunks.results.slice(i, i + 10);
       const vectors = [];
 
       for (const chunk of batch) {
@@ -221,8 +232,10 @@ async function handleRepairArchive(env, params) {
               preview: chunk.content.slice(0, 200),
             },
           });
+          lastId = chunk.id;
         } catch (error) {
           errors.push(`${chunk.source_file}[${chunk.chunk_index}]: ${error.message}`);
+          lastId = chunk.id;
         }
       }
 
@@ -236,15 +249,26 @@ async function handleRepairArchive(env, params) {
       }
     }
 
-    let output = `Repair complete.\n`;
-    output += `Total chunks in DB: ${allChunks.results.length}\n`;
-    output += `Missing vectors found: ${missing.length}\n`;
-    output += `Repaired this run: ${repaired}\n`;
-    if (missing.length > batchSize) {
-      output += `Remaining: ${missing.length - repaired} (run again to continue)\n`;
+    // Save progress
+    await env.DB.prepare(
+      "INSERT OR REPLACE INTO repair_progress (id, last_id) VALUES (1, ?)"
+    )
+      .bind(lastId)
+      .run();
+
+    const remaining = total - lastId;
+    let output = `Repair progress:\n`;
+    output += `Total chunks: ${total}\n`;
+    output += `Processed this run: ${chunks.results.length}\n`;
+    output += `Vectors upserted: ${repaired}\n`;
+    output += `Progress: ${lastId}/${total} (${Math.round((lastId / total) * 100)}%)\n`;
+    if (remaining > 0) {
+      output += `Remaining: ~${remaining} (run again to continue)\n`;
+    } else {
+      output += `Complete! All chunks vectorized.\n`;
     }
     if (errors.length > 0) {
-      output += `Errors: ${errors.length}\n`;
+      output += `Errors this run: ${errors.length}\n`;
     }
 
     return output;
