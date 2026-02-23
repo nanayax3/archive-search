@@ -39,6 +39,25 @@ const TOOLS = [
       properties: {},
     },
   },
+  {
+    name: "repair_archive",
+    description:
+      "Find and re-embed chunks that are in the database but missing from the vector index. " +
+      "Run this after migration to patch gaps caused by rate limits. " +
+      "Returns count of repaired chunks.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        batch_size: {
+          type: "integer",
+          description: "Chunks to process per run (default 50, max 200). Use smaller values to avoid rate limits.",
+          default: 50,
+          minimum: 1,
+          maximum: 200,
+        },
+      },
+    },
+  },
 ];
 
 // ═══ EMBEDDING ═══
@@ -145,6 +164,92 @@ async function handleGetStats(env) {
     return output;
   } catch (error) {
     return `Error getting stats: ${error.message}`;
+  }
+}
+
+// ═══ REPAIR HANDLER ═══
+
+async function handleRepairArchive(env, params) {
+  const batchSize = Math.min(Math.max(params.batch_size || 50, 1), 200);
+
+  try {
+    // Get all chunk IDs from D1
+    const allChunks = await env.DB.prepare(
+      "SELECT id, content, source_file, chunk_index FROM archive_chunks ORDER BY id"
+    ).all();
+
+    if (!allChunks.results || allChunks.results.length === 0) {
+      return "No chunks in database. Nothing to repair.";
+    }
+
+    // Check which ones have vectors by trying to fetch them
+    const missing = [];
+    for (const chunk of allChunks.results) {
+      const vectorId = `chunk-${chunk.id}`;
+      try {
+        const result = await env.VECTORS.getByIds([vectorId]);
+        if (!result || result.length === 0) {
+          missing.push(chunk);
+        }
+      } catch {
+        missing.push(chunk);
+      }
+    }
+
+    if (missing.length === 0) {
+      return `All ${allChunks.results.length} chunks have vectors. Nothing to repair.`;
+    }
+
+    // Process missing chunks in batches
+    const toProcess = missing.slice(0, batchSize);
+    let repaired = 0;
+    const errors = [];
+
+    for (let i = 0; i < toProcess.length; i += 10) {
+      const batch = toProcess.slice(i, i + 10);
+      const vectors = [];
+
+      for (const chunk of batch) {
+        try {
+          const embedding = await getEmbedding(env.AI, chunk.content.slice(0, 8000));
+          vectors.push({
+            id: `chunk-${chunk.id}`,
+            values: embedding,
+            metadata: {
+              source_file: chunk.source_file,
+              chunk_index: chunk.chunk_index,
+              preview: chunk.content.slice(0, 200),
+            },
+          });
+        } catch (error) {
+          errors.push(`${chunk.source_file}[${chunk.chunk_index}]: ${error.message}`);
+        }
+      }
+
+      if (vectors.length > 0) {
+        try {
+          await env.VECTORS.upsert(vectors);
+          repaired += vectors.length;
+        } catch (error) {
+          errors.push(`Upsert error: ${error.message}`);
+        }
+      }
+    }
+
+    let output = `Repair complete.\n`;
+    output += `Total chunks in DB: ${allChunks.results.length}\n`;
+    output += `Missing vectors found: ${missing.length}\n`;
+    output += `Repaired this run: ${repaired}\n`;
+    if (missing.length > batchSize) {
+      output += `Remaining: ${missing.length - repaired} (run again to continue)\n`;
+    }
+    if (errors.length > 0) {
+      output += `Errors: ${errors.length}\n`;
+    }
+
+    return output;
+  } catch (error) {
+    return `Error during repair: ${error.message}`;
   }
 }
 
@@ -288,6 +393,11 @@ async function handleMCPRequest(request, env) {
           case "get_archive_stats":
             result = {
               content: [{ type: "text", text: await handleGetStats(env) }],
+            };
+            break;
+          case "repair_archive":
+            result = {
+              content: [{ type: "text", text: await handleRepairArchive(env, toolParams) }],
             };
             break;
           default:

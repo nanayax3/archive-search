@@ -98,6 +98,16 @@ Semantic search across your conversation archive.
 
 Returns total chunks indexed and source file count.
 
+### `repair_archive`
+
+Finds chunks in the database that are missing vector embeddings and re-embeds them. Run this after migration to patch gaps caused by rate limits during ingestion.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `batch_size` | integer | no | Chunks to process per run (default 50, max 200) |
+
+Run multiple times if needed — it processes in batches and reports remaining count.
+
 ## Connecting to your AI client
 
 ### Claude Desktop / Claude Code
