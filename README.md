@@ -274,37 +274,34 @@ Check the pricing pages for each service to calculate your own costs:
 - **[Vectorize pricing](https://developers.cloudflare.com/vectorize/platform/pricing/)** — vector index queries
 - **[Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/)** — request handling
 
-### Ongoing usage (searching)
+### How much does it actually cost?
 
-Searching is effectively free. Each search generates one embedding (~500 tokens) and one Vectorize query. Even hundreds of searches per day won't approach free tier limits:
-- Workers: 100,000 requests/day
-- D1: 5M rows read/day, 5GB storage
-- Vectorize: 30M queries/month
-- Workers AI: 10,000 neurons/day
+Cloudflare measures AI compute in [neurons](https://developers.cloudflare.com/workers-ai/platform/pricing/). The free tier gives you **10,000 neurons per day** (resets at 00:00 UTC). Embedding models are extremely cheap because they're small, fast operations — much cheaper than text generation.
 
-### Initial ingestion (embedding your conversations)
+**The math for embeddings (`bge-base-en-v1.5`):**
+- Cost: **6,058 neurons per 1,000,000 input tokens**
+- A 2000-character chunk is ~500 tokens
+- One chunk costs: 500 ÷ 1,000,000 × 6,058 = **~0.003 neurons**
 
-This is where cost matters. Every chunk needs an embedding generated via Workers AI, which costs [neurons](https://developers.cloudflare.com/workers-ai/platform/pricing/) — Cloudflare's unit for GPU compute. The free tier gives you **10,000 neurons per day**, and that resets daily.
+That's three thousandths of a neuron per chunk. Which means:
 
-The key detail: **you cannot embed a large archive in one session on the free tier.** The daily neuron limit means the migration script will hit rate limits partway through. Some chunks will be stored in the database but fail to get their vector embeddings. This is expected — not an error.
+| Archive size | Neurons used | % of free daily limit |
+|-------------|-------------|----------------------|
+| 10,000 chunks | ~30 neurons | 0.3% |
+| 20,000 chunks | ~63 neurons | 0.6% |
+| 50,000 chunks | ~152 neurons | 1.5% |
+| 100,000 chunks | ~303 neurons | 3% |
 
-**How free-tier ingestion actually works:**
+**You can embed your entire archive in a single session on the free tier.** Even 100,000 chunks uses only 3% of the daily free allocation. We tested this ourselves — 20,755 chunks embedded in one hour, on the free plan, using under 1% of the daily limit.
 
-1. **Day 1:** Run `node scripts/migrate.js`. All chunks get stored in D1 (database writes are cheap). Embedding generation runs until you hit the daily neuron limit. Some chunks get vectors, the rest don't.
-2. **Day 2+:** Use the `repair_archive` MCP tool (or call it via the API). It scans the database, finds chunks that are missing vectors, and re-embeds only those. It tracks its position — each run picks up where the last one left off.
-3. **Repeat daily** until `repair_archive` reports all chunks are complete.
+The other services are similarly generous for this use case:
+- **Workers:** 100,000 requests/day (ingestion + searches)
+- **D1:** 5M rows read/day, 5GB storage
+- **Vectorize:** 30M queries/month
 
-How many days depends on your archive size. A rough estimate: each 2000-character chunk costs ~500 tokens to embed. At 6,058 neurons per 1M tokens, 10,000 free neurons/day covers roughly **3,300 chunks per day**. So:
+**In practice, this project runs entirely for free** — both initial ingestion and ongoing searches. The `repair_archive` tool exists as a safety net in case any embeddings fail during ingestion (e.g., due to network errors or temporary rate limits), but you should not need to run it across multiple days.
 
-| Archive size | Free tier timeline |
-|-------------|-------------------|
-| 5,000 chunks | ~2 days |
-| 20,000 chunks | ~7 days |
-| 50,000 chunks | ~15 days |
-
-**If you don't want to wait:** On the Workers Paid plan ($5/month), overages beyond the free 10,000 neurons/day are billed at $0.011 per 1,000 neurons. Even a 50k-chunk archive costs under $2 to embed all at once. The paid plan also raises limits on D1 and Workers.
-
-**After ingestion, ongoing cost is $0.** Searching only uses a handful of neurons per query. You won't hit the daily limit with normal usage.
+On the free plan, if you somehow exceed 10,000 neurons/day, requests fail with an error — **you will never be surprised with a bill.** On the Workers Paid plan ($5/month), overages are billed at $0.011 per 1,000 neurons, but you'd need to embed millions of chunks in a single day to even notice.
 
 ## License
 
