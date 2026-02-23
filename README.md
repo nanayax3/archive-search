@@ -52,13 +52,20 @@ wrangler vectorize create archive-search-vectors --dimensions=768 --metric=cosin
 
 ### 4. Set your API key
 
-Generate a key and add it to `wrangler.toml`:
+Generate a key and store it as a Cloudflare secret (never commit it to your repo):
 
 ```bash
+# Generate a random key
 openssl rand -hex 16
+
+# Deploy first (so the Worker exists)
+wrangler deploy
+
+# Then set the secret
+echo "your-generated-key" | wrangler secret put API_KEY
 ```
 
-### 5. Deploy
+### 5. Apply migrations and deploy
 
 ```bash
 # Apply database migrations
@@ -184,6 +191,80 @@ Any MCP-compatible client can connect via:
 3. **Indexing**: Embeddings are stored in Cloudflare Vectorize with metadata linking back to the D1 record
 4. **Searching**: Query text is embedded with the same model, then matched against the index using cosine similarity
 5. **Fallback**: If no vector matches are found, a text-based `LIKE` search runs against D1
+
+## Security and privacy
+
+If you're using this to store personal conversations, you should understand exactly where your data lives and who can access it.
+
+### What gets stored and where
+
+Your data lives in three Cloudflare services:
+
+| Service | What it holds | Encryption at rest |
+|---------|--------------|-------------------|
+| **D1** (database) | Full text of every conversation chunk, file paths, timestamps | AES-256-GCM |
+| **Vectorize** (vector index) | Embedding vectors + metadata (file paths, 200-char text previews) | AES-256-GCM (stored on R2) |
+| **Workers AI** | Nothing — text is processed for embeddings and not retained | N/A |
+
+All data is encrypted in transit (TLS) and at rest (AES-256-GCM). Encryption and decryption are automatic.
+
+### Cloudflare is not zero-knowledge
+
+**This is the most important thing to understand.** Cloudflare manages the encryption keys. Your data is encrypted at rest, but Cloudflare holds the keys — meaning a sufficiently privileged employee or a legal compulsion could theoretically result in data access.
+
+Access is restricted by organizational controls:
+- Employees require unique credentials with hardware-token MFA
+- Least-privilege and zero-trust authorization
+- All personnel with data access are under contractual confidentiality obligations
+- Cloudflare's [DPA](https://www.cloudflare.com/cloudflare-customer-dpa/) commits to never providing encryption keys or customer data feeds to law enforcement
+
+This is strong protection through **policy and contract**, but it is not the same as technical impossibility. If you need zero-knowledge encryption for your data, this architecture is not the right fit — consider a local deployment instead (see [vault-archive-product](https://github.com/nanayax3/vault-archive-product) for a fully local alternative using ChromaDB).
+
+### Workers AI and your text
+
+When your text is sent to Workers AI for embedding generation:
+- It is **not stored or logged** by Cloudflare
+- It is **not used for training** any models — [Cloudflare explicitly commits to this](https://developers.cloudflare.com/workers-ai/platform/data-usage/)
+- Processing runs on **Cloudflare's own GPU network**, not sent to third parties
+- The embedding model (`bge-base-en-v1.5`) is an open-source model hosted on Cloudflare hardware
+
+### Data location
+
+D1 automatically places your database near where you created it. You can set a jurisdiction at creation time for data residency:
+
+```bash
+# Keep data in the EU
+wrangler d1 create archive-search --location=eu
+
+# FedRAMP-compliant locations
+wrangler d1 create archive-search --location=fedramp
+```
+
+Jurisdictions are **immutable after creation**. If you need EU data residency, set it when you create the database — you can't add it later.
+
+### Authentication
+
+The Worker uses a single API key for all authenticated endpoints. The key is stored as a [Cloudflare secret](https://developers.cloudflare.com/workers/configuration/secrets/) (encrypted, never visible in your code or dashboard). Two auth methods are supported:
+
+- **Bearer token**: `Authorization: Bearer your-key` header
+- **Path token**: `/mcp/your-key` in the URL
+
+**Important**: Never commit your API key to version control. The included `.gitignore` excludes `wrangler.toml` (which may contain your database ID), but your API key should always be set via `wrangler secret put API_KEY`.
+
+### What this project does NOT include
+
+- **No rate limiting per caller** — anyone with your API key can make unlimited requests (within Cloudflare's free tier limits of 100k requests/day)
+- **No audit logging** — searches are not logged (which is good for privacy, but means you can't detect unauthorized access)
+- **No key rotation mechanism** — to rotate, generate a new key and run `wrangler secret put API_KEY` again
+- **CORS is permissive** (`Access-Control-Allow-Origin: *`) — appropriate for MCP clients, but means the API is callable from any origin with the key
+
+### Cloudflare's certifications
+
+Cloudflare maintains SOC 2 Type II, ISO 27001, ISO 27018 (cloud privacy), ISO 27701 (privacy information management), and PCI DSS certifications. Full details at [Cloudflare Trust Hub](https://www.cloudflare.com/trust-hub/compliance-resources/).
+
+### The honest summary
+
+Your conversation data is encrypted at rest and in transit, processed on Cloudflare's infrastructure (not sent to third parties), and not used for training. Cloudflare is contractually and organizationally restricted from accessing it. But they hold the encryption keys, so "can't access" is a policy guarantee, not a cryptographic one. For most personal use cases this is solid protection — comparable to storing data in any major cloud provider. If your threat model requires zero-knowledge encryption, host locally instead.
 
 ## Cost
 

@@ -6,9 +6,9 @@ main = "src/index.js"
 compatibility_date = "2024-01-01"
 compatibility_flags = ["nodejs_compat"]
 
-[vars]
-# Generate with: openssl rand -hex 16
-API_KEY = "your-api-key-here"
+# API_KEY is stored as a Cloudflare secret — never commit it to your repo.
+# After first deploy, run: echo "your-key" | wrangler secret put API_KEY
+# Generate a key with: openssl rand -hex 16
 
 [[d1_databases]]
 binding = "DB"
