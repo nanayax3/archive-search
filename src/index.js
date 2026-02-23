@@ -378,6 +378,12 @@ function checkAuth(request, env) {
   return token === env.API_KEY;
 }
 
+function checkPathAuth(url, env) {
+  if (!url.pathname.startsWith("/mcp/")) return false;
+  const pathToken = url.pathname.slice(5);
+  return pathToken.length > 0 && pathToken === env.API_KEY;
+}
+
 // ═══ MCP HANDLER ═══
 
 async function handleMCPRequest(request, env) {
@@ -467,17 +473,24 @@ export default {
       });
     }
 
+    // MCP endpoint — supports both /mcp with Bearer auth and /mcp/TOKEN path auth
+    const hasPathAuth = checkPathAuth(url, env);
+    if ((url.pathname === "/mcp" || hasPathAuth || url.pathname.startsWith("/mcp/")) && request.method === "POST") {
+      if (!checkAuth(request, env) && !hasPathAuth) {
+        return new Response(
+          JSON.stringify({ jsonrpc: "2.0", id: 0, error: { code: -32600, message: "Unauthorized" } }),
+          { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      return handleMCPRequest(request, env);
+    }
+
     // Auth check for all other endpoints
     if (!checkAuth(request, env)) {
       return new Response(
         JSON.stringify({ error: "Unauthorized" }),
         { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
-    }
-
-    // MCP endpoint
-    if (url.pathname === "/mcp" && request.method === "POST") {
-      return handleMCPRequest(request, env);
     }
 
     // Ingest endpoint
