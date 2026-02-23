@@ -110,9 +110,23 @@ The tool tracks its scan position — run it multiple times and it picks up wher
 
 ## Connecting to your AI client
 
-### Claude Desktop / Claude Code
+This is a **cloud MCP server** — once deployed, it's accessible from any client that supports remote MCP connections. No local servers to run.
 
-Add to your MCP configuration:
+### Claude Desktop (Remote MCP)
+
+1. Open Claude Desktop settings
+2. Add a new remote MCP server (connector)
+3. Use the URL with your API key in the path:
+
+```
+https://archive-search.your-subdomain.workers.dev/mcp/your-api-key
+```
+
+That's it — no headers needed, no local config files. The server is available from any device where you use Claude.
+
+### Claude Code
+
+Add to your `.claude.json` or MCP settings:
 
 ```json
 {
@@ -128,11 +142,18 @@ Add to your MCP configuration:
 }
 ```
 
+### Other MCP clients
+
+Any MCP-compatible client can connect via:
+- **Path auth:** `POST https://archive-search.your-subdomain.workers.dev/mcp/your-api-key`
+- **Header auth:** `POST https://archive-search.your-subdomain.workers.dev/mcp` with `Authorization: Bearer your-api-key`
+
 ## HTTP Endpoints
 
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
 | `/mcp` | POST | Bearer | MCP protocol handler |
+| `/mcp/TOKEN` | POST | Path | MCP protocol handler (token in URL) |
 | `/ingest` | POST | Bearer | Bulk upload chunks |
 | `/health` | GET | No | Health check |
 | `/stats` | GET | Bearer | Archive statistics |
