@@ -60,12 +60,82 @@ const TOOLS = [
   },
 ];
 
+// ═══ RESULT SHAPING ═══
+// Two things make a raw vector search read badly on this corpus:
+//
+//   1. The same passage exists in more than one file. The handover ritual is
+//      the usual cause — a summary written at the end of one conversation and
+//      pasted at the top of the next — so the identical text scores twice and
+//      fills the page. Collapse by content hash and name every file it appears
+//      in; the duplication is information, not noise.
+//
+//   2. Neighbouring chunks of one long file all match a broad query and crowd
+//      everything else out. Cap how many any single file may contribute.
+
+const MAX_PER_FILE = 2;
+
+function collapseResults(results, limit) {
+  const byHash = new Map();
+  const seen = [];
+
+  for (const r of results) {
+    const key = r.content_hash || `${r.source_file}#${r.chunk_index}`;
+    const existing = byHash.get(key);
+    if (existing) {
+      if (!existing.also_in.includes(r.source_file)) existing.also_in.push(r.source_file);
+      existing.relevance = Math.max(existing.relevance, r.relevance);
+      continue;
+    }
+    const entry = { ...r, also_in: [] };
+    byHash.set(key, entry);
+    seen.push(entry);
+  }
+
+  const perFile = new Map();
+  const kept = [];
+  for (const r of seen.sort((a, b) => b.relevance - a.relevance)) {
+    const n = perFile.get(r.source_file) || 0;
+    if (n >= MAX_PER_FILE) continue;
+    perFile.set(r.source_file, n + 1);
+    kept.push(r);
+    if (kept.length >= limit) break;
+  }
+  return kept;
+}
+
+// ═══ IDENTITY ═══
+// A chunk is identified by the file it came from and its position in that file
+// — never by a database row id. Row ids change on every re-ingest, which used
+// to strand the old vector in the index pointing at a row that no longer
+// existed. Deriving the vector id from (source_file, chunk_index) means a
+// re-ingest overwrites its own vector instead of abandoning it.
+
+async function sha256Hex(text) {
+  const bytes = new TextEncoder().encode(text);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function vectorIdFor(sourceFile, chunkIndex) {
+  const fileHash = (await sha256Hex(sourceFile)).slice(0, 16);
+  return `chunk-${fileHash}-${chunkIndex}`;
+}
+
 // ═══ EMBEDDING ═══
+
+// The embedding model and how much text it can actually read. bge-base has a
+// 512-token window — roughly 2000 characters — so anything longer is silently
+// truncated by the model itself. Keep MAX_EMBED_CHARS honest about that: it is
+// better to know the tail is being dropped than to pass 8000 characters and
+// assume they were used. Chunk size in the ingest scripts should stay at or
+// under this number.
+const EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
+const MAX_EMBED_CHARS = 2000;
 
 async function getEmbedding(ai, text) {
   // Sanitize input — strip characters that can produce bad embeddings
-  const clean = text.replace(/[^\x20-\x7E\n\r\t]/g, ' ').slice(0, 8000);
-  const result = await ai.run("@cf/baai/bge-base-en-v1.5", { text: [clean] });
+  const clean = text.replace(/[^\x20-\x7E\n\r\t]/g, ' ').slice(0, MAX_EMBED_CHARS);
+  const result = await ai.run(EMBEDDING_MODEL, { text: [clean] });
   const embedding = result.data[0];
   // Sanitize output — replace NaN/Infinity with 0
   for (let i = 0; i < embedding.length; i++) {
@@ -86,23 +156,39 @@ async function handleSearchArchive(env, params) {
     // Generate query embedding
     const embedding = await getEmbedding(env.AI, query);
 
-    // Search Vectorize
+    // Over-fetch: identical passages and long runs from one file get collapsed
+    // below, so ask for more than we intend to show.
     const vectorResults = await env.VECTORS.query(embedding, {
-      topK: nResults,
+      topK: Math.min(nResults * 4, 60),
       returnMetadata: "all",
     });
 
     let results = [];
 
     if (vectorResults.matches && vectorResults.matches.length > 0) {
-      // Fetch full content from D1 for each match
       for (const match of vectorResults.matches) {
-        const chunkId = match.id.replace("chunk-", "");
-        const row = await env.DB.prepare(
-          "SELECT source_file, content, chunk_index FROM archive_chunks WHERE id = ?"
-        )
-          .bind(chunkId)
-          .first();
+        // Look the chunk up by what actually identifies it. Falls back to the
+        // old row-id-in-the-vector-id scheme so vectors written before the
+        // deterministic-id change still resolve.
+        let row = null;
+        const meta = match.metadata;
+        if (meta?.source_file != null && meta?.chunk_index != null) {
+          row = await env.DB.prepare(
+            "SELECT source_file, content, chunk_index, content_hash FROM archive_chunks WHERE source_file = ? AND chunk_index = ?"
+          )
+            .bind(meta.source_file, meta.chunk_index)
+            .first();
+        }
+        if (!row) {
+          const legacyId = match.id.replace("chunk-", "");
+          if (/^\d+$/.test(legacyId)) {
+            row = await env.DB.prepare(
+              "SELECT source_file, content, chunk_index, content_hash FROM archive_chunks WHERE id = ?"
+            )
+              .bind(legacyId)
+              .first();
+          }
+        }
 
         if (row) {
           results.push({
@@ -110,10 +196,13 @@ async function handleSearchArchive(env, params) {
             text: row.content,
             relevance: match.score,
             chunk_index: row.chunk_index,
+            content_hash: row.content_hash,
           });
         }
       }
     }
+
+    results = collapseResults(results, nResults);
 
     // Fallback to text search if no vector results
     if (results.length === 0) {
@@ -143,7 +232,13 @@ async function handleSearchArchive(env, params) {
       const r = results[i];
       output += `${"=".repeat(80)}\n`;
       output += `Result ${i + 1} | Relevance: ${r.relevance.toFixed(3)}\n`;
-      output += `Source: ${r.source_file}\n\n`;
+      output += `Source: ${r.source_file}\n`;
+      if (r.also_in && r.also_in.length) {
+        // The same passage in more than one conversation — usually the seam
+        // where a handover summary was carried from one thread into the next.
+        output += `Also appears in: ${r.also_in.join(", ")}\n`;
+      }
+      output += `\n`;
       output += `${r.text}\n\n`;
     }
 
@@ -214,13 +309,13 @@ async function handleRepairArchive(env, params) {
     const missing = [];
     for (let i = 0; i < pageChunks.results.length; i += 20) {
       const batch = pageChunks.results.slice(i, i + 20);
-      const batchIds = batch.map(c => `chunk-${c.id}`);
-      const found = await env.VECTORS.getByIds(batchIds);
-      const foundSet = new Set(found.map(v => v.id));
-      for (const chunk of batch) {
-        if (!foundSet.has(`chunk-${chunk.id}`)) {
-          missing.push(chunk);
-        }
+      const wanted = await Promise.all(
+        batch.map(async (c) => ({ chunk: c, vid: await vectorIdFor(c.source_file, c.chunk_index) }))
+      );
+      const found = await env.VECTORS.getByIds(wanted.map((w) => w.vid));
+      const foundSet = new Set(found.map((v) => v.id));
+      for (const w of wanted) {
+        if (!foundSet.has(w.vid)) missing.push(w.chunk);
       }
     }
 
@@ -231,7 +326,7 @@ async function handleRepairArchive(env, params) {
       try {
         const embedding = await getEmbedding(env.AI, chunk.content);
         await env.VECTORS.upsert([{
-          id: `chunk-${chunk.id}`,
+          id: await vectorIdFor(chunk.source_file, chunk.chunk_index),
           values: embedding,
           metadata: {
             source_file: chunk.source_file,
@@ -241,7 +336,7 @@ async function handleRepairArchive(env, params) {
         }]);
         repaired++;
       } catch (error) {
-        errors.push(`chunk-${chunk.id}: ${error.message}`);
+        errors.push(`${chunk.source_file}#${chunk.chunk_index}: ${error.message}`);
       }
     }
 
@@ -294,18 +389,26 @@ async function handleIngest(request, env) {
     const batch = chunks.slice(i, i + 50);
     const stmts = [];
 
+    // Hash the content up front. The hash is what lets search collapse a
+    // passage that exists in more than one file into one result.
+    for (const chunk of batch) {
+      chunk._hash = await sha256Hex(chunk.content);
+    }
+
     for (const chunk of batch) {
       stmts.push(
         env.DB.prepare(
-          `INSERT INTO archive_chunks (source_file, chunk_index, total_chunks, content, era, conversation_title)
-           VALUES (?, ?, ?, ?, ?, ?)`
+          `INSERT OR REPLACE INTO archive_chunks
+             (source_file, chunk_index, total_chunks, content, era, conversation_title, content_hash)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`
         ).bind(
           chunk.source_file,
           chunk.chunk_index,
           chunk.total_chunks || 1,
           chunk.content,
           chunk.era || null,
-          chunk.conversation_title || null
+          chunk.conversation_title || null,
+          chunk._hash
         )
       );
     }
@@ -327,16 +430,18 @@ async function handleIngest(request, env) {
   }
 
   // Vectorize in batches of 100 (embedding + upsert)
-  const toVectorize = chunks.filter((c) => c._id);
+  // Everything gets a vector, keyed by (source_file, chunk_index) — not by row id,
+  // so a re-ingest overwrites the old vector rather than orphaning it.
+  const toVectorize = chunks;
   for (let i = 0; i < toVectorize.length; i += 100) {
     const batch = toVectorize.slice(i, i + 100);
     const vectors = [];
 
     for (const chunk of batch) {
       try {
-        const embedding = await getEmbedding(env.AI, chunk.content.slice(0, 8000));
+        const embedding = await getEmbedding(env.AI, chunk.content);
         vectors.push({
-          id: `chunk-${chunk._id}`,
+          id: await vectorIdFor(chunk.source_file, chunk.chunk_index),
           values: embedding,
           metadata: {
             source_file: chunk.source_file,
