@@ -120,6 +120,58 @@ A file is only recorded in the manifest once **every one of its chunks has been 
 
 Failures are written to `sweep.log`, one line each, and every run stamps a summary line. An empty log is provably healthy rather than merely quiet, and a stale final timestamp is the alarm for the sweeper itself having died.
 
+## Upgrading an existing deployment
+
+If you already have this running, you do not have to take all of it. The correctness fixes and the model change are independent, and the first group is cheap.
+
+### Step 1 — the fixes (no re-embedding)
+
+**Check for duplicate rows first.** Migration `0002` adds a unique index on `(source_file, chunk_index)`, which will fail outright if duplicates already exist — and if you have ever re-ingested a file, they do:
+
+```sql
+SELECT source_file, chunk_index, COUNT(*) AS copies
+FROM archive_chunks GROUP BY 1, 2 HAVING copies > 1;
+```
+
+If that returns rows, keep one of each before migrating:
+
+```sql
+DELETE FROM archive_chunks WHERE id NOT IN (
+  SELECT MIN(id) FROM archive_chunks GROUP BY source_file, chunk_index
+);
+```
+
+Then apply the migrations and deploy:
+
+```bash
+wrangler d1 migrations apply archive-search --remote
+wrangler deploy
+```
+
+You now get: re-ingestion that replaces instead of duplicating, duplicate passages collapsed in results, per-file caps, and vector ids that stop stranding their predecessors. Existing vectors keep working — search falls back to the old row-id scheme for anything written before the change, so nothing breaks while the index is mixed.
+
+Any file you re-ingest from here on picks up the new ids. Re-ingesting everything (`node scripts/sweep.js --full`) converts the whole index and lets you drop the old vectors, but it is optional at this stage.
+
+### Step 2 — the embedding model (re-embeds everything)
+
+`bge-m3` produces 1024-dimensional vectors and the old model produced 768. Vectorize indexes have a fixed dimension, so this is a **new index**, not a migration.
+
+Build it alongside the live one rather than replacing it:
+
+```bash
+wrangler vectorize create archive-search-vectors-m3 --dimensions=1024 --metric=cosine
+```
+
+Add it as a second binding in `wrangler.toml` while keeping the old one, then in `src/index.js` point `WRITE_INDEX` at the new binding and leave `READ_INDEX` on the old. Deploy, and run a full re-ingest:
+
+```bash
+VAULT_PATH=... WORKER_URL=... API_KEY=... node scripts/sweep.js --full
+```
+
+Searches keep working off the old index throughout. When the new one is populated, flip `READ_INDEX` and deploy — a one-line change, reversible the same way. Keep the old index until you have lived with the new one for a while; delete it when you stop reaching for it.
+
+Expect the re-ingest to take a while and to bump against Workers AI daily limits on a large archive. It is safe to stop and restart: the manifest means the next run resumes where it left off.
+
 ## MCP Tools
 
 ### `search_archive`
