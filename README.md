@@ -5,10 +5,12 @@ A Cloudflare Worker that provides **semantic search** across conversation archiv
 ## What it does
 
 - Stores conversation chunks in Cloudflare D1
-- Generates embeddings with Workers AI (BGE model, 768 dimensions)
+- Generates embeddings with Workers AI (`@cf/baai/bge-m3` — 8192-token window, 1024 dimensions, 100+ languages)
 - Indexes embeddings in Cloudflare Vectorize for semantic search
 - Exposes search via MCP so any compatible AI client can query it
 - Falls back to text search when vector results are empty
+- **Keeps itself up to date**: `scripts/sweep.js` ingests only files that are new or changed, so it can be scheduled nightly and left alone
+- **Collapses duplicate passages**: the same text in two files returns once, listing every file it appears in, instead of filling the page with copies
 
 ## Architecture
 
@@ -47,7 +49,7 @@ wrangler d1 create archive-search
 # Copy the database_id into your wrangler.toml
 
 # Create Vectorize index
-wrangler vectorize create archive-search-vectors --dimensions=768 --metric=cosine
+wrangler vectorize create archive-search-vectors --dimensions=1024 --metric=cosine
 ```
 
 ### 4. Set your API key
@@ -66,6 +68,9 @@ echo "your-generated-key" | wrangler secret put API_KEY
 ```
 
 ### 5. Apply migrations and deploy
+
+Migrations are applied in order. `0002` adds the unique index that makes re-ingestion replace rather than duplicate, plus a content hash column; `0003` normalises path separators on any rows ingested before that was enforced. If you are starting fresh, applying all three in order is all that is needed.
+
 
 ```bash
 # Apply database migrations
@@ -87,6 +92,33 @@ node scripts/migrate.js
 ```
 
 Your conversations should be `.md` files in any directory structure. The script discovers them recursively.
+
+### 7. Keep it up to date automatically
+
+`migrate.js` ingests everything, every time. `sweep.js` ingests only what has changed since the last run, using a manifest of content hashes stored next to the script:
+
+```bash
+VAULT_PATH="/path/to/your/conversations" \
+WORKER_URL="https://archive-search.your-subdomain.workers.dev" \
+API_KEY="your-api-key" \
+node scripts/sweep.js
+```
+
+Unchanged files cost nothing — they are skipped without being read into chunks or embedded. Run it from cron, a systemd timer, Task Scheduler, or as the last step of a backup you already run nightly.
+
+| Flag | Effect |
+|---|---|
+| *(none)* | ingest new and changed files only |
+| `--full` | ignore the manifest and re-ingest everything (use after changing the embedding model or chunk size, which invalidates every existing vector) |
+| `--dry-run` | report what would be ingested without sending anything |
+
+Optional environment variables: `CHUNK_SIZE` (default 2000), `CHUNK_OVERLAP` (default 200), `PAUSE_MS` between batches, `MANIFEST_PATH`, `LOG_PATH`.
+
+**Why a sweep rather than detecting when a conversation is finished:** nothing marks a thread as done, and some are never done. "Which files changed since I last looked" is a much easier question, and it gives the same result a day later. A conversation that grew today is searchable tomorrow; one that ended today is searchable tomorrow too.
+
+A file is only recorded in the manifest once **every one of its chunks has been accepted**. If a batch fails — a rate limit, a dropped connection — that file is left unrecorded and picked up again on the next run. The failure mode to avoid is a file marked as ingested whose chunks never arrived: a permanent gap that looks exactly like a healthy night.
+
+Failures are written to `sweep.log`, one line each, and every run stamps a summary line. An empty log is provably healthy rather than merely quiet, and a stale final timestamp is the alarm for the sweeper itself having died.
 
 ## MCP Tools
 
@@ -186,11 +218,26 @@ Any MCP-compatible client can connect via:
 
 ## How it works
 
-1. **Chunking**: Conversations are split into 2000-character chunks with 200-character overlap to preserve context at boundaries
-2. **Embedding**: Each chunk is embedded using `@cf/baai/bge-base-en-v1.5` (768-dimensional vectors)
-3. **Indexing**: Embeddings are stored in Cloudflare Vectorize with metadata linking back to the D1 record
-4. **Searching**: Query text is embedded with the same model, then matched against the index using cosine similarity
-5. **Fallback**: If no vector matches are found, a text-based `LIKE` search runs against D1
+1. **Chunking**: Conversations are split into overlapping chunks (2000 characters with 200 of overlap by default) so context is preserved across boundaries
+2. **Embedding**: Each chunk is embedded with `@cf/baai/bge-m3` — 1024 dimensions, an 8192-token window, and 100+ languages
+3. **Indexing**: Embeddings go into Vectorize under an id derived from `(source_file, chunk_index)`, with the same pair in the metadata
+4. **Searching**: The query is embedded with the same model, matched by cosine similarity, then the results are collapsed and capped before being returned
+5. **Fallback**: If no vector matches are found, a text `LIKE` search runs against D1
+
+### A chunk is identified by where it came from, not by a row id
+
+Vector ids are derived from `(source_file, chunk_index)`. This matters more than it sounds:
+
+- Re-ingesting a file **overwrites its own vectors** instead of writing new ones and abandoning the old. Deriving the id from a database row id means every re-ingest strands the previous vector in the index, pointing at a row that no longer exists — the index grows without bound and searches start hitting ghosts whose lookup comes back empty.
+- `source_file` is stored with **forward slashes on every platform**. Ingesting the same vault from Windows and from Linux otherwise produces two different strings for the same file, the unique index does not collide, and the entire corpus is silently inserted a second time.
+- Re-chunking can produce **fewer** chunks than before. `INSERT OR REPLACE` updates `0..n-1` and leaves everything past `n` behind, so the ingest deletes chunks at or beyond the new count for that file.
+
+### Duplicate passages are collapsed, and long files are capped
+
+Two things make raw vector search read badly on a conversation corpus:
+
+- **The same passage lives in more than one file.** A summary written at the end of one conversation and pasted into the start of the next is byte-identical in both, so it scores twice and pushes everything else off the page. Identical passages are returned once, with an `Also appears in:` line naming every file they occur in — the duplication is information about where two conversations join, not noise to discard.
+- **One long file can fill the results.** Neighbouring chunks of the same document all match a broad query, so any single file contributes at most two results. The search over-fetches to compensate.
 
 ## Security and privacy
 
