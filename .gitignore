@@ -3,3 +3,7 @@ node_modules/
 .wrangler/
 wrangler.toml
 .dev.vars
+
+# sweep state — the manifest lists every file path in the vault
+scripts/sweep-manifest.json
+scripts/sweep.log

@@ -114,6 +114,15 @@ function collapseResults(results, limit) {
 // existed. Deriving the vector id from (source_file, chunk_index) means a
 // re-ingest overwrites its own vector instead of abandoning it.
 
+// Path separators are canonically forward slashes. The archive was first
+// ingested from Windows, where path.relative() yields backslashes; the same
+// vault swept from Linux yields forward slashes, and the two are different
+// strings. Without this, running the sweep from a second machine silently
+// duplicates the entire corpus instead of updating it.
+function canonicalPath(p) {
+  return String(p).replace(/\\/g, "/");
+}
+
 async function sha256Hex(text) {
   const bytes = new TextEncoder().encode(text);
   const digest = await crypto.subtle.digest("SHA-256", bytes);
@@ -396,6 +405,7 @@ async function handleIngest(request, env) {
     // Hash the content up front. The hash is what lets search collapse a
     // passage that exists in more than one file into one result.
     for (const chunk of batch) {
+      chunk.source_file = canonicalPath(chunk.source_file);
       chunk._hash = await sha256Hex(chunk.content);
     }
 
