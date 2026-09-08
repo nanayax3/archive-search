@@ -23,3 +23,11 @@ index_name = "archive-search-vectors"
 
 [ai]
 binding = "AI"
+
+# Optional. Only needed while migrating to a different embedding model, when
+# two indexes exist at once: point ingest at the new one and keep search on the
+# old until it is populated and verified, then set both to the new one.
+# Unset, everything uses the VECTORS binding.
+# [vars]
+# WRITE_INDEX = "VECTORS_M3"
+# READ_INDEX  = "VECTORS"

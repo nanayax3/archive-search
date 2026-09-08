@@ -142,17 +142,18 @@ async function vectorIdFor(sourceFile, chunkIndex) {
 // better to know the tail is being dropped than to pass 8000 characters and
 // assume they were used. Chunk size in the ingest scripts should stay at or
 // under this number.
-// Two indexes exist during a model migration: the live one and the one being
-// built. Ingest writes to WRITE_INDEX, search reads from READ_INDEX. Flipping
-// to the new index is a one-line change once it has been verified, and the old
-// index stays intact until then.
+// A single index is the normal case: bind it as VECTORS and nothing below
+// needs configuring. During an embedding-model change there are briefly two,
+// because Vectorize indexes have a fixed dimension and a new model means a new
+// index rather than a migration. Set WRITE_INDEX and READ_INDEX as vars in
+// wrangler.toml to point ingest at the new index while search keeps serving
+// from the old one; flipping over afterwards is a config change, not a deploy
+// of different code.
 const EMBEDDING_MODEL = "@cf/baai/bge-m3";       // 8192-token window, 1024 dims, multilingual
 const MAX_EMBED_CHARS = 8000;                    // comfortably inside that window
-const WRITE_INDEX = "VECTORS_M3";
-const READ_INDEX = "VECTORS_M3";                // flipped 8 Sept 2026 after verification
 
-const writeIndex = (env) => env[WRITE_INDEX] || env.VECTORS;
-const readIndex = (env) => env[READ_INDEX] || env.VECTORS;
+const writeIndex = (env) => env[env.WRITE_INDEX || "VECTORS"] || env.VECTORS;
+const readIndex = (env) => env[env.READ_INDEX || "VECTORS"] || env.VECTORS;
 
 async function getEmbedding(ai, text) {
   // Sanitize input — strip characters that can produce bad embeddings

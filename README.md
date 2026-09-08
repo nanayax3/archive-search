@@ -162,13 +162,21 @@ Build it alongside the live one rather than replacing it:
 wrangler vectorize create archive-search-vectors-m3 --dimensions=1024 --metric=cosine
 ```
 
-Add it as a second binding in `wrangler.toml` while keeping the old one, then in `src/index.js` point `WRITE_INDEX` at the new binding and leave `READ_INDEX` on the old. Deploy, and run a full re-ingest:
+Add it as a second binding in `wrangler.toml` while keeping the old one, then set the two vars so ingest writes to the new index while search keeps reading the old:
+
+```toml
+[vars]
+WRITE_INDEX = "VECTORS_M3"
+READ_INDEX  = "VECTORS"
+```
+
+Deploy, and run a full re-ingest:
 
 ```bash
 VAULT_PATH=... WORKER_URL=... API_KEY=... node scripts/sweep.js --full
 ```
 
-Searches keep working off the old index throughout. When the new one is populated, flip `READ_INDEX` and deploy — a one-line change, reversible the same way. Keep the old index until you have lived with the new one for a while; delete it when you stop reaching for it.
+Searches keep working off the old index throughout. When the new one is populated, set `READ_INDEX` to the new binding and deploy — a config change rather than a code change, and reversible the same way. Keep the old index until you have lived with the new one for a while; delete it when you stop reaching for it.
 
 Expect the re-ingest to take a while and to bump against Workers AI daily limits on a large archive. It is safe to stop and restart: the manifest means the next run resumes where it left off.
 
