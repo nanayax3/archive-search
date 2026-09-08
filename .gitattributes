@@ -1,0 +1,8 @@
+# Normalise line endings. The working copy lives in a Syncthing folder shared
+# with a Windows machine, so files arrive as CRLF; without this every commit
+# shows as a full-file rewrite and real diffs become unreviewable.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.gz  binary
