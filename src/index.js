@@ -149,7 +149,7 @@ async function vectorIdFor(sourceFile, chunkIndex) {
 const EMBEDDING_MODEL = "@cf/baai/bge-m3";       // 8192-token window, 1024 dims, multilingual
 const MAX_EMBED_CHARS = 8000;                    // comfortably inside that window
 const WRITE_INDEX = "VECTORS_M3";
-const READ_INDEX = "VECTORS";                    // flip to VECTORS_M3 after verification
+const READ_INDEX = "VECTORS_M3";                // flipped 8 Sept 2026 after verification
 
 const writeIndex = (env) => env[WRITE_INDEX] || env.VECTORS;
 const readIndex = (env) => env[READ_INDEX] || env.VECTORS;
