@@ -79,7 +79,11 @@ function collapseResults(results, limit) {
   const seen = [];
 
   for (const r of results) {
-    const key = r.content_hash || `${r.source_file}#${r.chunk_index}`;
+    // Key on the text itself, not on the stored hash. Rows ingested before
+    // migration 0002 have content_hash NULL, and falling back to file+index
+    // would give every row a unique key — which silently disables the whole
+    // point of this function. The text is already in hand; use it.
+    const key = r.text ? `t:${r.text.length}:${r.text}` : `${r.source_file}#${r.chunk_index}`;
     const existing = byHash.get(key);
     if (existing) {
       if (!existing.also_in.includes(r.source_file)) existing.also_in.push(r.source_file);
