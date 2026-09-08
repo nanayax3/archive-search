@@ -142,8 +142,17 @@ async function vectorIdFor(sourceFile, chunkIndex) {
 // better to know the tail is being dropped than to pass 8000 characters and
 // assume they were used. Chunk size in the ingest scripts should stay at or
 // under this number.
-const EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
-const MAX_EMBED_CHARS = 2000;
+// Two indexes exist during a model migration: the live one and the one being
+// built. Ingest writes to WRITE_INDEX, search reads from READ_INDEX. Flipping
+// to the new index is a one-line change once it has been verified, and the old
+// index stays intact until then.
+const EMBEDDING_MODEL = "@cf/baai/bge-m3";       // 8192-token window, 1024 dims, multilingual
+const MAX_EMBED_CHARS = 8000;                    // comfortably inside that window
+const WRITE_INDEX = "VECTORS_M3";
+const READ_INDEX = "VECTORS";                    // flip to VECTORS_M3 after verification
+
+const writeIndex = (env) => env[WRITE_INDEX] || env.VECTORS;
+const readIndex = (env) => env[READ_INDEX] || env.VECTORS;
 
 async function getEmbedding(ai, text) {
   // Sanitize input — strip characters that can produce bad embeddings
@@ -171,7 +180,7 @@ async function handleSearchArchive(env, params) {
 
     // Over-fetch: identical passages and long runs from one file get collapsed
     // below, so ask for more than we intend to show.
-    const vectorResults = await env.VECTORS.query(embedding, {
+    const vectorResults = await readIndex(env).query(embedding, {
       topK: Math.min(nResults * 4, 60),
       returnMetadata: "all",
     });
@@ -325,7 +334,7 @@ async function handleRepairArchive(env, params) {
       const wanted = await Promise.all(
         batch.map(async (c) => ({ chunk: c, vid: await vectorIdFor(c.source_file, c.chunk_index) }))
       );
-      const found = await env.VECTORS.getByIds(wanted.map((w) => w.vid));
+      const found = await writeIndex(env).getByIds(wanted.map((w) => w.vid));
       const foundSet = new Set(found.map((v) => v.id));
       for (const w of wanted) {
         if (!foundSet.has(w.vid)) missing.push(w.chunk);
@@ -338,7 +347,7 @@ async function handleRepairArchive(env, params) {
     for (const chunk of missing) {
       try {
         const embedding = await getEmbedding(env.AI, chunk.content);
-        await env.VECTORS.upsert([{
+        await writeIndex(env).upsert([{
           id: await vectorIdFor(chunk.source_file, chunk.chunk_index),
           values: embedding,
           metadata: {
@@ -427,15 +436,29 @@ async function handleIngest(request, env) {
       );
     }
 
+    // Re-chunking a file can produce FEWER chunks than last time (a larger
+    // chunk size, or the file was edited down). INSERT OR REPLACE updates
+    // 0..n-1 and leaves everything past n behind: rows belonging to a chunking
+    // scheme that no longer exists, still matching searches. Drop them.
+    for (const chunk of batch) {
+      if (chunk.chunk_index === 0 && chunk.total_chunks) {
+        stmts.push(
+          env.DB.prepare(
+            "DELETE FROM archive_chunks WHERE source_file = ? AND chunk_index >= ?"
+          ).bind(chunk.source_file, chunk.total_chunks)
+        );
+      }
+    }
+
     try {
       const results = await env.DB.batch(stmts);
-      // Get the inserted IDs
-      for (let j = 0; j < results.length; j++) {
-        const lastId = results[j].meta?.last_row_id;
-        if (lastId) {
-          inserted++;
-          batch[j]._id = lastId;
-        }
+      // stmts holds this batch's inserts PLUS, per file, one DELETE that trims
+      // chunks left over from a previous chunking scheme — so it is longer than
+      // batch. Iterating results and writing batch[j] ran off the end of the
+      // array and threw on every single batch. Nothing downstream needs the row
+      // ids any more; vector ids come from (source_file, chunk_index).
+      for (let j = 0; j < batch.length && j < results.length; j++) {
+        if (results[j]?.meta?.last_row_id) inserted++;
       }
     } catch (error) {
       errors.push(`D1 batch error at ${i}: ${error.message}`);
@@ -470,7 +493,7 @@ async function handleIngest(request, env) {
 
     if (vectors.length > 0) {
       try {
-        await env.VECTORS.upsert(vectors);
+        await writeIndex(env).upsert(vectors);
         vectorized += vectors.length;
       } catch (error) {
         errors.push(`Vectorize upsert error at ${i}: ${error.message}`);
