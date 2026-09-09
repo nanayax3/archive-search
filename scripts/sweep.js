@@ -34,7 +34,8 @@ if (!VAULT_PATH || !WORKER_URL || !API_KEY) {
 const FULL = process.argv.includes("--full");
 const DRY_RUN = process.argv.includes("--dry-run");
 
-// Keep these identical to migrate.js. CHUNK_SIZE must also stay at or under
+// NOTE: migrate.js still uses the old character-offset chunker and is superseded
+// by `sweep.js --full`. Do not run both against one index.
 // what the embedding model can actually read, or the tail of every chunk is
 // silently discarded — see MAX_EMBED_CHARS in src/index.js.
 const CHUNK_SIZE = Number(process.env.CHUNK_SIZE || 2000);
@@ -51,17 +52,95 @@ function log(line) {
   try { fs.appendFileSync(LOG_PATH, stamped + "\n"); } catch {}
 }
 
-function chunkText(text) {
-  if (text.length <= CHUNK_SIZE) return [text];
-  const chunks = [];
-  let start = 0;
-  while (start < text.length) {
-    const end = start + CHUNK_SIZE;
-    chunks.push(text.slice(start, end));
-    start = end - CHUNK_OVERLAP;
-    if (end >= text.length) break;
+// ── chunking ────────────────────────────────────────────────────────────────
+// Chunks are built out of WHOLE MESSAGES, never raw character offsets.
+//
+// The old version sliced every 2000 characters regardless of what was there,
+// so roughly half of all chunk boundaries landed inside a word — results that
+// began "icture. You need to know if Claude can hold all of me" — and a single
+// chunk routinely mixed the tail of one exchange with the head of the next,
+// which blurs what it embeds to. Diagnosed a month before it was fixed.
+//
+// So: split on the message markers first, then pack whole messages up to the
+// size limit. A message is only ever cut if it alone exceeds the limit, and
+// then on paragraph boundaries before sentence boundaries before characters.
+
+const MSG_MARKER = /^>\[!nexus_(?:user|agent)\]/m;
+
+function splitMessages(text) {
+  // Everything before the first marker is frontmatter and title — keep it as
+  // its own leading block so a conversation's title still gets indexed.
+  const idxs = [];
+  const re = /^>\[!nexus_(?:user|agent)\]/gm;
+  let m;
+  while ((m = re.exec(text)) !== null) idxs.push(m.index);
+  if (!idxs.length) {
+    // Not a conversation export — fall back to paragraphs, which at least
+    // never cut a word in half.
+    return text.split(/\n\s*\n/).filter((p) => p.trim());
   }
-  return chunks;
+  const out = [];
+  const preamble = text.slice(0, idxs[0]).trim();
+  if (preamble) out.push(preamble);
+  for (let i = 0; i < idxs.length; i++) {
+    const piece = text.slice(idxs[i], i + 1 < idxs.length ? idxs[i + 1] : text.length).trim();
+    if (piece) out.push(piece);
+  }
+  return out;
+}
+
+function splitOversized(msg, limit) {
+  // One message longer than a whole chunk. Cut it as gently as possible.
+  if (msg.length <= limit) return [msg];
+  const parts = [];
+  for (const para of msg.split(/\n\s*\n/)) {
+    if (para.length <= limit) { parts.push(para); continue; }
+    let rest = para;
+    while (rest.length > limit) {
+      const window = rest.slice(0, limit);
+      let cut = Math.max(window.lastIndexOf(". "), window.lastIndexOf("! "), window.lastIndexOf("? "));
+      if (cut < limit * 0.5) cut = window.lastIndexOf(" ");
+      if (cut < limit * 0.5) cut = limit;
+      parts.push(rest.slice(0, cut + 1).trim());
+      rest = rest.slice(cut + 1);
+    }
+    if (rest.trim()) parts.push(rest.trim());
+  }
+  return parts;
+}
+
+function chunkText(text) {
+  const msgs = splitMessages(text).flatMap((m) => splitOversized(m, CHUNK_SIZE));
+  const chunks = [];
+  let buf = [], size = 0;
+
+  const flush = () => {
+    if (!buf.length) return;
+    chunks.push(buf.join("\n\n"));
+    // Overlap by carrying the last whole message forward, so context survives
+    // the seam without anything being cut mid-word. If that message is itself
+    // large, carry only its tail.
+    const last = buf[buf.length - 1];
+    let carry = last;
+    if (last.length > CHUNK_OVERLAP) {
+      // Taking a raw tail would cut mid-word and reintroduce the exact fault
+      // this rewrite exists to remove, one seam later. Advance to the next line
+      // break so the carried fragment at least starts somewhere clean.
+      const tail = last.slice(-CHUNK_OVERLAP);
+      const nl = tail.indexOf("\n");
+      carry = nl >= 0 ? tail.slice(nl + 1) : "";
+    }
+    buf = CHUNK_OVERLAP > 0 && carry.trim() ? [carry] : [];
+    size = buf.reduce((n, p) => n + p.length + 2, 0);
+  };
+
+  for (const msg of msgs) {
+    if (size + msg.length + 2 > CHUNK_SIZE && buf.length) flush();
+    buf.push(msg);
+    size += msg.length + 2;
+  }
+  if (buf.length) chunks.push(buf.join("\n\n"));
+  return chunks.filter((c) => c.trim());
 }
 
 function findMarkdownFiles(dir) {
