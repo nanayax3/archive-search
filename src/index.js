@@ -25,6 +25,13 @@ const TOOLS = [
           minimum: 1,
           maximum: 20,
         },
+        context: {
+          type: "integer",
+          description: "Show the neighbouring chunks either side of each hit for context (0-2, default 1). A match can land at the start of a chunk with the exchange that led to it in the one before.",
+          default: 1,
+          minimum: 0,
+          maximum: 2,
+        },
       },
       required: ["query"],
     },
@@ -172,6 +179,7 @@ async function getEmbedding(ai, text) {
 async function handleSearchArchive(env, params) {
   const query = params.query;
   const nResults = Math.min(Math.max(params.n_results || 5, 1), 20);
+  const contextChunks = Math.min(Math.max(params.context ?? 1, 0), 2);
 
   if (!query) return "Error: query parameter required";
 
@@ -248,6 +256,47 @@ async function handleSearchArchive(env, params) {
       }
     }
 
+    // Neighbouring chunks. A hit can land at the very start of a chunk with the
+    // exchange that produced it sitting in the previous one, so a bare chunk
+    // often reads as beginning mid-thought even when it starts cleanly. Trimmed
+    // hard on both sides — this is context, not more result.
+    const EDGE = 420;
+    if (contextChunks > 0) {
+      for (const r of results) {
+        const near = await env.DB.prepare(
+          `SELECT chunk_index, content FROM archive_chunks
+           WHERE source_file = ? AND chunk_index BETWEEN ? AND ? AND chunk_index != ?
+           ORDER BY chunk_index`
+        ).bind(r.source_file, r.chunk_index - contextChunks, r.chunk_index + contextChunks, r.chunk_index).all();
+        for (const row of near.results || []) {
+          const isBefore = row.chunk_index < r.chunk_index;
+          const text = String(row.content || "");
+          let slice = isBefore ? text.slice(-EDGE) : text.slice(0, EDGE);
+          // Chunks overlap by design, so the tail of the previous one is
+          // already sitting at the top of this result. Showing it twice makes
+          // the context look like a stutter. Trim whatever is already present.
+          if (isBefore) {
+            for (let cut = Math.min(slice.length, 400); cut > 40; cut -= 20) {
+              if (r.text.startsWith(slice.slice(-cut).trimStart().slice(0, 60))) {
+                slice = slice.slice(0, slice.length - cut);
+                break;
+              }
+            }
+          } else {
+            for (let cut = Math.min(slice.length, 400); cut > 40; cut -= 20) {
+              if (r.text.endsWith(slice.slice(0, cut).trimEnd().slice(-60))) {
+                slice = slice.slice(cut);
+                break;
+              }
+            }
+          }
+          if (!slice.trim()) continue;
+          if (isBefore) r.before = (r.before ? r.before + "\n" : "") + slice;
+          else r.after = (r.after ? r.after + "\n" : "") + slice;
+        }
+      }
+    }
+
     // Format output
     let output = `Search: '${query}'\nFound ${results.length} results:\n\n`;
 
@@ -262,7 +311,10 @@ async function handleSearchArchive(env, params) {
         output += `Also appears in: ${r.also_in.join(", ")}\n`;
       }
       output += `\n`;
-      output += `${r.text}\n\n`;
+      if (r.before) output += `[…before] ${r.before.trim()}\n\n`;
+      output += `${r.text}\n`;
+      if (r.after) output += `\n[after…] ${r.after.trim()}\n`;
+      output += `\n`;
     }
 
     output += `${"=".repeat(80)}\n`;
