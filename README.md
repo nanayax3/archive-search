@@ -112,7 +112,7 @@ Unchanged files cost nothing — they are skipped without being read into chunks
 | `--full` | ignore the manifest and re-ingest everything (use after changing the embedding model or chunk size, which invalidates every existing vector) |
 | `--dry-run` | report what would be ingested without sending anything |
 
-Optional environment variables: `CHUNK_SIZE` (default 2000), `CHUNK_OVERLAP` (default 200), `PAUSE_MS` between batches, `MANIFEST_PATH`, `LOG_PATH`.
+Optional environment variables: `CHUNK_SIZE` (default 2000 — the maximum a chunk may reach; whole messages are packed up to it), `CHUNK_OVERLAP` (default 200), `PAUSE_MS` between batches, `MANIFEST_PATH`, `LOG_PATH`.
 
 **Why a sweep rather than detecting when a conversation is finished:** nothing marks a thread as done, and some are never done. "Which files changed since I last looked" is a much easier question, and it gives the same result a day later. A conversation that grew today is searchable tomorrow; one that ended today is searchable tomorrow too.
 
@@ -278,11 +278,21 @@ Any MCP-compatible client can connect via:
 
 ## How it works
 
-1. **Chunking**: Conversations are split into overlapping chunks (2000 characters with 200 of overlap by default) so context is preserved across boundaries
+1. **Chunking**: Conversations are split on **message boundaries**, not character offsets — whole turns are packed up to the size limit and a message is only ever cut if it alone exceeds it
 2. **Embedding**: Each chunk is embedded with `@cf/baai/bge-m3` — 1024 dimensions, an 8192-token window, and 100+ languages
 3. **Indexing**: Embeddings go into Vectorize under an id derived from `(source_file, chunk_index)`, with the same pair in the metadata
 4. **Searching**: The query is embedded with the same model, matched by cosine similarity, then the results are collapsed and capped before being returned
 5. **Fallback**: If no vector matches are found, a text `LIKE` search runs against D1
+
+### Chunks are made of whole messages
+
+Slicing a transcript every N characters is the obvious implementation and it is badly wrong. Measured across 60 conversations in this archive, **50.8% of chunks produced that way begin partway through a word** — results that open `"icture. You need to know if..."`. Worse, a single chunk routinely holds the tail of one exchange and the head of the next, so its embedding is a vector for two unrelated things averaged together.
+
+`sweep.js` splits on the turn markers the exports already contain, packs whole messages up to the size limit, and only ever cuts a message that exceeds the limit on its own — on paragraph boundaries first, then sentences, then characters. Files with no markers fall back to paragraphs, which at least never cut a word. The same measurement afterwards: **0.8%**.
+
+The overlap needs the same care. Carrying a raw tail of the previous chunk reintroduces the identical fault one seam later, so the carry advances to the next line break.
+
+Changing this **requires a full re-ingest** (`node scripts/sweep.js --full`) — chunk boundaries are baked into the stored text and its embedding, and nothing can be patched in place.
 
 ### A chunk is identified by where it came from, not by a row id
 
