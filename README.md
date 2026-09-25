@@ -395,21 +395,21 @@ Check the pricing pages for each service to calculate your own costs:
 
 Cloudflare measures AI compute in [neurons](https://developers.cloudflare.com/workers-ai/platform/pricing/). The free tier gives you **10,000 neurons per day** (resets at 00:00 UTC). Embedding models are extremely cheap because they're small, fast operations — much cheaper than text generation.
 
-**The math for embeddings (`bge-base-en-v1.5`):**
-- Cost: **6,058 neurons per 1,000,000 input tokens**
-- A 2000-character chunk is ~500 tokens
-- One chunk costs: 500 ÷ 1,000,000 × 6,058 = **~0.003 neurons**
+**The math for embeddings (`bge-m3`, the model this worker uses):**
+- Cost: **1,075 neurons per 1,000,000 input tokens** ([pricing page](https://developers.cloudflare.com/workers-ai/platform/pricing/), checked September 2026)
+- A 2000-character chunk is roughly 500 tokens (it varies a little by language)
+- One chunk costs: 500 ÷ 1,000,000 × 1,075 = **~0.0005 neurons**
 
-That's three thousandths of a neuron per chunk. Which means:
+That's about half a thousandth of a neuron per chunk. Which means:
 
 | Archive size | Neurons used | % of free daily limit |
 |-------------|-------------|----------------------|
-| 10,000 chunks | ~30 neurons | 0.3% |
-| 20,000 chunks | ~63 neurons | 0.6% |
-| 50,000 chunks | ~152 neurons | 1.5% |
-| 100,000 chunks | ~303 neurons | 3% |
+| 10,000 chunks | ~5 neurons | 0.05% |
+| 20,000 chunks | ~11 neurons | 0.1% |
+| 50,000 chunks | ~27 neurons | 0.3% |
+| 100,000 chunks | ~54 neurons | 0.5% |
 
-**You can embed your entire archive in a single session on the free tier.** Even 100,000 chunks uses only 3% of the daily free allocation. We tested this ourselves — 20,755 chunks embedded in one hour, on the free plan, using under 1% of the daily limit.
+**You can embed your entire archive in a single session on the free tier.** Even 100,000 chunks uses about half a percent of the daily free allocation. We tested this ourselves with the older `bge-base-en-v1.5` model, which costs almost six times as much per token (6,058 neurons per million): 20,755 chunks embedded in one hour, on the free plan, using under 1% of the daily limit. bge-m3 is cheaper still.
 
 The other services are similarly generous for this use case:
 - **Workers:** 100,000 requests/day (ingestion + searches)
