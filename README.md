@@ -343,7 +343,7 @@ When your text is sent to Workers AI for embedding generation:
 - It is **not stored or logged** by Cloudflare
 - It is **not used for training** any models — [Cloudflare explicitly commits to this](https://developers.cloudflare.com/workers-ai/platform/data-usage/)
 - Processing runs on **Cloudflare's own GPU network**, not sent to third parties
-- The embedding model (`bge-base-en-v1.5`) is an open-source model hosted on Cloudflare hardware
+- The embedding model (`bge-m3`) is an open-source model hosted on Cloudflare hardware
 
 ### Data location
 
