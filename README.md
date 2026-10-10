@@ -120,6 +120,32 @@ A file is only recorded in the manifest once **every one of its chunks has been 
 
 Failures are written to `sweep.log`, one line each, and every run stamps a summary line. An empty log is provably healthy rather than merely quiet, and a stale final timestamp is the alarm for the sweeper itself having died.
 
+### 8. Claude Code sessions, too
+
+`scripts/cc-export.js` turns Claude Code transcripts (the `.jsonl` files in `~/.claude/projects/`) into the same markdown the importer writes for ChatGPT and claude.ai exports, so the sweep picks them up like everything else.
+
+Most of a transcript isn't conversation. For one ninety-hour thread, 25.5 MB of file held 350 kB of things actually said: 1.4%. The rest is tool calls, tool results and bookkeeping. The exporter keeps only what was said, strips what the harness injects into user turns (system reminders, hook output, the replayed summary after compaction), and skips sessions that a machine started.
+
+```bash
+OUT_DIR="/path/to/your/conversations/claude-code" node scripts/cc-export.js --dry-run
+```
+
+| Variable | Default | |
+|---|---|---|
+| `SESSIONS_DIR` | `~/.claude/projects` | where the transcripts are |
+| `OUT_DIR` | `~/conversations/claude-code` | put it **inside** `VAULT_PATH` |
+| `MIN_MESSAGES` | `2` | fewer than this is a mis-start, not a thread |
+| `MACHINE_PROMPTS` | — | regexes for the first user turn of sessions to skip: cron wakes, bridges, tests. A JSON array, or one per line |
+| `HOOK_LINES` | — | regexes for lines your own hooks inject, to strip. Same format |
+
+Flags: `--dry-run`, `--include-thinking`, `--all` (include subagent runs). It compares before writing, so unchanged sessions aren't rewritten and the sweep doesn't re-embed them.
+
+Run it just before the sweep, e.g. `ExecStartPre=` in the same systemd unit. **Name your machine sessions.** Ours outnumbered the real conversations fifty to seven, and without the list every search came back full of cron wakes talking to themselves.
+
+What it writes is the whole conversation in plain text, so keep `OUT_DIR` as private as the transcripts.
+
+**Searchable minutes after a session ends, not tomorrow:** a Claude Code `SessionEnd` hook can start the export-and-sweep without waiting for it. There's one in [scar-tissue](https://github.com/nanayax3/scar-tissue) (`hooks/session_end.sh`).
+
 ## Upgrading an existing deployment
 
 If you already have this running, you do not have to take all of it. The correctness fixes and the model change are independent, and the first group is cheap.
